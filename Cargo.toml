@@ -7,9 +7,6 @@ edition = "2021"
 license = "MIT"
 authors = ["Guzmán Monné"]
 
-[profile.dev.package.insta]
-opt-level = 3
-
 [profile.dev]
 # Disabling debug info speeds up builds.
 debug = 0
@@ -18,5 +15,3 @@ debug = 0
 incremental = true
 # Set this to 1 or 2 to get more useful backtraces in debugger.
 debug = 0
-
-
