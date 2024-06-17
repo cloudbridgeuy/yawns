@@ -1,0 +1,22 @@
+[package]
+name = "yawns"
+version = "0.0.0"
+homepage = "https://github.com/cloudbridgeuy/yawns"
+description = "Shortcuts to fairly used aws commands"
+autobins = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yawns"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.203", features = ["derive"] }
+clap = { version = "4.5.7", features = ["derive", "string"] }
+color-eyre = "0.6.3"
+env_logger = "0.11.3"
+log = "0.4.21"
+thiserror = "1.0.61"
