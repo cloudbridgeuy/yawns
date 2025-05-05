@@ -14,6 +14,8 @@ pub enum Commands {
     /// Get the policy attached to the key.
     #[clap(name = "get-policy")]
     GetPolicy(GetPolicyOptions),
+
+    /// Gets the list of existing keys.
     #[clap(name = "list-keys")]
     ListKeys,
 }
@@ -31,7 +33,7 @@ pub async fn run(app: App, global: crate::Global) -> Result<()> {
         aprintln!(
             "AWS Region        : {}",
             global
-                .aws_region
+                .region
                 .as_ref()
                 .ok_or_else(|| eyre!("AWS_REGION not defined"))?
         );

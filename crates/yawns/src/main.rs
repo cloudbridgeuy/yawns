@@ -7,6 +7,7 @@ mod aws;
 mod error;
 mod kms;
 mod prelude;
+mod s3;
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -27,10 +28,10 @@ pub struct App {
 pub struct Global {
     /// AWS Region
     #[clap(long, env = "AWS_REGION", global = true, default_value = "us-east-1")]
-    aws_region: Option<String>,
+    region: Option<String>,
     /// AWS Profile
     #[clap(long, env = "AWS_PROFILE", global = true, default_value = "default")]
-    aws_profile: Option<String>,
+    profile: Option<String>,
 
     /// Whether to display additional information.
     #[clap(long, env = "YAWNS_VERBOSE", global = true, default_value = "false")]
@@ -41,6 +42,9 @@ pub struct Global {
 pub enum SubCommands {
     /// AWS KMS (AWS Key Management Service)
     KMS(crate::kms::App),
+
+    /// AWS S3
+    S3(crate::s3::App),
 }
 
 #[tokio::main]
@@ -51,8 +55,8 @@ async fn main() -> Result<()> {
     let app = App::parse();
 
     match app.command {
-        SubCommands::KMS(sub_app) => crate::kms::run(sub_app, app.global),
+        SubCommands::KMS(sub_app) => crate::kms::run(sub_app, app.global).await,
+        SubCommands::S3(sub_app) => crate::s3::run(sub_app, app.global).await,
     }
-    .await
-    .map_err(|err| eyre!(err))
+    .map_err(|err: color_eyre::eyre::Report| eyre!(err))
 }
