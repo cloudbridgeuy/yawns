@@ -27,6 +27,10 @@ pub enum Commands {
     /// Copies a list of objects between buckets.
     #[clap(name = "copy-list")]
     CopyList(CopyListOptions),
+
+    /// Counts the number of objects in a bucket with a given prefix.
+    #[clap(name = "count-files")]
+    CountFiles(CountFilesOptions),
 }
 
 #[derive(Debug, clap::Args, serde::Serialize, serde::Deserialize, Clone)]
@@ -70,6 +74,16 @@ pub struct CopyListOptions {
     metadata: Option<Vec<(String, String)>>,
 }
 
+#[derive(Debug, clap::Args, Clone)]
+pub struct CountFilesOptions {
+    /// AWS S3 Bucket.
+    #[clap(long, env = "AWS_S3_BUCKET")]
+    bucket: String,
+    /// AWS S3 Object prefix to count.
+    #[clap(long, env = "AWS_S3_OBJECT_PREFIX")]
+    prefix: Option<String>,
+}
+
 /// Parse a single key-value pair
 fn parse_key_val<T, U>(
     s: &str,
@@ -106,6 +120,7 @@ pub async fn run(app: App, global: crate::Global) -> Result<()> {
         Commands::ListBuckets => list_buckets(client).await,
         Commands::Copy(options) => copy(client, options).await,
         Commands::CopyList(options) => copy_list(client, options).await,
+        Commands::CountFiles(options) => count_files(client, options).await,
     }
 }
 
@@ -183,6 +198,9 @@ pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> 
     // Create a semaphore to control concurrency
     let semaphore = Arc::new(Semaphore::new(options.max_concurrent));
 
+    let document_lines = src.split("\n");
+    let document_lines_length = document_lines.clone().count();
+
     // Spawn a progress logger task in a separate async task
     let copied_count_for_progress = copied_count.clone();
     let progress_handle = tokio::spawn(async move {
@@ -196,43 +214,55 @@ pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> 
                 0.0
             };
             aprintln!(
-                "Progress: {} files copied in {:.2} seconds ({:.2} files/second)",
+                "Progress: {}/{} files copied in {:.2} seconds ({:.2} files/second)",
                 count,
+                document_lines_length,
                 elapsed.as_secs_f64(),
                 rate
             );
         }
     });
 
-    let copy_futures = src.split("\n").map(|line| {
-        let client = client.clone();
+    let mut request = client
+        .copy_object()
+        .bucket(options.destination_bucket.clone())
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace);
+
+    for (key, value) in metadata {
+        request = request.metadata(key, value);
+    }
+
+    let copy_futures = document_lines.map(|line| {
+        let request = request.clone();
+
         let source_key = f!("{}/{}", source_prefix, line);
         // INFO: Notice the lack of `/` in the `f!` call!
         //       This is because we've set the prefix outside the
         //       creation of this future, when creating the
         //       `destination_prefix` variable.
         let destination_key = f!("{}{}", destination_prefix, line);
-        let destination_bucket = options.destination_bucket.clone();
+        let document_lines_length = document_lines_length.clone();
+
         let copied_count = copied_count.clone();
-        let metadata = metadata.clone();
         let semaphore = semaphore.clone();
 
         async move {
             // Acquire a permit for the semaphore
             let _permit = semaphore.acquire().await.unwrap();
 
-            let mut request = client
-                .copy_object()
+            let response = request
                 .copy_source(&source_key)
-                .bucket(destination_bucket.as_str())
                 .key(destination_key.as_str())
-                .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace);
+                .send()
+                .await?;
 
-            for (key, value) in metadata {
-                request = request.metadata(key, value);
+            if let Some(copy_object_result) = response.copy_object_result {
+                if copy_object_result.e_tag.is_none() {
+                    aprintln!("Failed to copy from {source_key}: No ETag found",);
+                }
+            } else {
+                aprintln!("Failed to copy from {source_key}: No CopyObjectResult found",);
             }
-
-            let response = request.send().await?;
 
             copied_count.fetch_add(1, Ordering::Relaxed);
 
@@ -250,11 +280,52 @@ pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> 
     let rate = total_copied as f64 / duration.as_secs_f64();
 
     aprintln!(
-        "\nCopied {} files in {:.2} seconds ({:.2} files/second)",
+        "\nCopied {}/{} files in {:.2} seconds ({:.2} files/second)",
         total_copied,
+        document_lines_length,
         duration.as_secs_f64(),
         rate
     );
+
+    Ok(())
+}
+
+/// Counts the number of objects in a bucket with a given prefix.
+pub async fn count_files(client: aws_sdk_s3::Client, options: CountFilesOptions) -> Result<()> {
+    aprintln!(
+        "Counting files in bucket: {} with prefix: {}",
+        options.bucket,
+        options.prefix.as_deref().unwrap_or("(none)")
+    );
+
+    let mut object_count: u64 = 0;
+    let mut continuation_token: Option<String> = None;
+
+    loop {
+        let mut list_objects_req = client.list_objects_v2().bucket(options.bucket.as_str());
+
+        if let Some(prefix) = options.prefix.as_deref() {
+            list_objects_req = list_objects_req.prefix(prefix);
+        }
+
+        if let Some(token) = continuation_token {
+            list_objects_req = list_objects_req.continuation_token(token);
+        }
+
+        let resp = list_objects_req.send().await?;
+
+        if let Some(contents) = resp.contents {
+            object_count += contents.len() as u64;
+        }
+
+        if let Some(next_token) = resp.next_continuation_token {
+            continuation_token = Some(next_token);
+        } else {
+            break; // No more pages
+        }
+    }
+
+    aprintln!("Total objects counted: {}", object_count);
 
     Ok(())
 }
