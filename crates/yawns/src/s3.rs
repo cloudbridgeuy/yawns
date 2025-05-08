@@ -171,13 +171,6 @@ pub async fn copy(client: aws_sdk_s3::Client, options: CopyOptions) -> Result<()
 
 /// Copy a list of objects from one bucket to another.
 pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> Result<()> {
-    aprintln!(
-        "Copying from {} to {} with max_concurrent {}",
-        options.source_bucket,
-        options.destination_bucket,
-        options.max_concurrent
-    );
-
     let src = options.src.contents()?;
     let source_prefix = if let Some(source_prefix) = options.source_prefix.clone() {
         f!("{}/{}", options.source_bucket, source_prefix)
@@ -185,9 +178,9 @@ pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> 
         options.source_bucket.clone()
     };
     let destination_prefix = if let Some(destination_prefix) = options.destination_prefix.clone() {
-        f!("{}/", destination_prefix)
+        destination_prefix
     } else {
-        "/".to_string()
+        "".to_string()
     };
     let metadata = options.metadata.unwrap_or_default();
 
@@ -232,16 +225,46 @@ pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> 
         request = request.metadata(key, value);
     }
 
-    let copy_futures = document_lines.map(|line| {
-        let request = request.clone();
+    aprintln!(
+        "Copying files from bucket {} to bucket {}",
+        options.source_bucket,
+        options.destination_bucket
+    );
 
-        let source_key = f!("{}/{}", source_prefix, line);
-        // INFO: Notice the lack of `/` in the `f!` call!
-        //       This is because we've set the prefix outside the
-        //       creation of this future, when creating the
-        //       `destination_prefix` variable.
-        let destination_key = f!("{}{}", destination_prefix, line);
-        let document_lines_length = document_lines_length.clone();
+    let copy_futures = document_lines.map(|line| {
+        let mut request = request.clone();
+        let destination_bucket = options.destination_bucket.clone();
+        let source_bucket = options.source_bucket.clone();
+
+        // Parse the `line` as if it was a `CSV` line with columns: `file`, `source_prefix`, and
+        // `destination_prefix`.
+        let tuple = line.split(",").collect::<Vec<_>>();
+
+        if tuple.len() < 3 {
+            panic!(
+                "Invalid line format: {}. Expected at least 3 columns.",
+                line
+            );
+        }
+
+        let file = tuple[0];
+        let source_prefix = f!("{}/{}", source_bucket, tuple[1]);
+        let destination_prefix = tuple[2];
+
+        if tuple.len() == 4 {
+            let serialized_metadata = tuple[3];
+            let serialized_pairs = serialized_metadata.split(" ").collect::<Vec<_>>();
+            for pair in serialized_pairs {
+                let split_vec: Vec<&str> = pair.split("=").collect::<Vec<_>>();
+                if split_vec.len() != 2 {
+                    continue;
+                }
+                request = request.metadata(split_vec[0], split_vec[1]);
+            }
+        }
+
+        let source_key = f!("{}{}", source_prefix, file);
+        let destination_key = f!("{}{}", destination_prefix, file);
 
         let copied_count = copied_count.clone();
         let semaphore = semaphore.clone();
@@ -250,11 +273,21 @@ pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> 
             // Acquire a permit for the semaphore
             let _permit = semaphore.acquire().await.unwrap();
 
-            let response = request
+            let response = match request
                 .copy_source(&source_key)
                 .key(destination_key.as_str())
                 .send()
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    aprintln!(
+                        "Failed to copy from {source_key} to {destination_key}. Error: {}",
+                        err
+                    );
+                    return Ok(());
+                }
+            };
 
             if let Some(copy_object_result) = response.copy_object_result {
                 if copy_object_result.e_tag.is_none() {
