@@ -25,6 +25,11 @@ pub enum Commands {
     Copy(CopyOptions),
 
     /// Copies a list of objects between buckets.
+    ///
+    /// The list of files to copy can be given as a CSV file with at least three columns:
+    /// file, source_prefix, destination_prefix, and optionally, metadata. Each column
+    /// should be separated by a comma. Metadata key value pairs are defined as `key=value`
+    /// strings separated by a space.
     #[clap(name = "copy-list")]
     CopyList(CopyListOptions),
 
