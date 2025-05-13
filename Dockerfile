@@ -29,9 +29,6 @@ WORKDIR /app
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/yawns ./yawns
 
-RUN useradd -m appuser
-USER appuser
-
 # Run the application
-ENTRYPOINT ["./yawns"]
+ENTRYPOINT ["/app/yawns"]
 
