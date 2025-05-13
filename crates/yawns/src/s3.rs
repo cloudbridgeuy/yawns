@@ -1,8 +1,13 @@
 use crate::prelude::*;
+use aws_smithy_types::byte_stream::ByteStream;
 use futures::future::join_all;
+use std::path::PathBuf;
+use std::str::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 
@@ -36,6 +41,15 @@ pub enum Commands {
     /// Counts the number of objects in a bucket with a given prefix.
     #[clap(name = "count-files")]
     CountFiles(CountFilesOptions),
+
+    /// Uploads a list of local objects to a remote Bucket.
+    ///
+    /// The list of files to copy can be given as a CSV file with at least three columns:
+    /// file, source_prefix, destination_prefix, and optionally, metadata. Each column
+    /// should be separated by a comma. Metadata key value pairs are defined as `key=value`
+    /// strings separated by a space.
+    #[clap(name = "upload-list")]
+    UploadList(UploadListOptions),
 }
 
 #[derive(Debug, clap::Args, serde::Serialize, serde::Deserialize, Clone)]
@@ -77,6 +91,24 @@ pub struct CopyListOptions {
     /// Metadata to add to the copied object in the form of KEY=VALUE pairs.
     #[clap(short, long, value_parser = parse_key_val::<String, String>, number_of_values = 1)]
     metadata: Option<Vec<(String, String)>>,
+}
+
+#[derive(Debug, clap::Args, Clone)]
+pub struct UploadListOptions {
+    /// List of local files to upload and their destination details read from file or Stdin (default.)
+    /// Each line should be in the format: local_path,destination_prefix[,metadata_key1=value1 metadata_key2=value2...]
+    /// Metadata is optional and space-separated key=value pairs.
+    #[clap(env = "AWS_S3_SRC_OBJECT_LIST", default_value = "-")]
+    src: clap_stdin::FileOrStdin,
+    /// AWS S3 Destination Bucket.
+    #[clap(long, env = "AWS_S3_DST_BUCKET")]
+    destination_bucket: String,
+    /// AWS S3 Source Object prefix.
+    #[clap(long, env = "AWS_S3_DST_OBJECT_PREFIX")]
+    destination_prefix: Option<String>,
+    /// Max concurrent upload threads to control the upload rate.
+    #[clap(long, env = "AWS_S3_MAX_CONCURRENT", default_value = "10")]
+    max_concurrent: usize,
 }
 
 #[derive(Debug, clap::Args, Clone)]
@@ -126,6 +158,7 @@ pub async fn run(app: App, global: crate::Global) -> Result<()> {
         Commands::Copy(options) => copy(client, options).await,
         Commands::CopyList(options) => copy_list(client, options).await,
         Commands::CountFiles(options) => count_files(client, options).await,
+        Commands::UploadList(options) => upload_list(client, options).await,
     }
 }
 
@@ -211,12 +244,18 @@ pub async fn copy_list(client: aws_sdk_s3::Client, options: CopyListOptions) -> 
             } else {
                 0.0
             };
+            let time_remaining = if rate > 0.0 {
+                (document_lines_length - count) as f64 / rate
+            } else {
+                0.0
+            };
             aprintln!(
-                "Progress: {}/{} files copied in {:.2} seconds ({:.2} files/second)",
+                "Progress: {}/{} files copied in {:.2} seconds ({:.2} files/second) time remaining {:.2} seconds",
                 count,
                 document_lines_length,
                 elapsed.as_secs_f64(),
-                rate
+                rate,
+                time_remaining
             );
         }
     });
@@ -366,4 +405,186 @@ pub async fn count_files(client: aws_sdk_s3::Client, options: CountFilesOptions)
     aprintln!("Total objects counted: {}", object_count);
 
     Ok(())
+}
+
+/// Upload a list of local files to an S3 bucket.
+pub async fn upload_list(client: aws_sdk_s3::Client, options: UploadListOptions) -> Result<()> {
+    let src_contents = options.src.contents()?;
+
+    // Atomic counter for tracking uploaded files
+    let uploaded_count = Arc::new(AtomicUsize::new(0));
+    let failed_count = Arc::new(AtomicUsize::new(0));
+    let start_time = Instant::now();
+
+    // Create a semaphore to control concurrency
+    let semaphore = Arc::new(Semaphore::new(options.max_concurrent));
+
+    let document_lines: Vec<_> = src_contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let document_lines_length = document_lines.len();
+
+    // Spawn a progress logger task
+    let uploaded_count_for_progress = uploaded_count.clone();
+    let failed_count_for_progress = failed_count.clone();
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(5)).await; // Update every 5 seconds
+            let uploaded = uploaded_count_for_progress.load(Ordering::Relaxed);
+            let failed = failed_count_for_progress.load(Ordering::Relaxed);
+            let elapsed = start_time.elapsed();
+            let total_processed = uploaded + failed;
+            let rate = if elapsed.as_secs_f64() > 0.0 {
+                total_processed as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            let time_remaining = if rate > 0.0 {
+                (document_lines_length - total_processed) as f64 / rate
+            } else {
+                0.0
+            };
+            aprintln!(
+                "Progress: {}/{} files uploaded, {} failed in {:.2} seconds ({:.2} files/second) time remaining {:.2} seconds",
+                uploaded,
+                document_lines_length,
+                failed,
+                elapsed.as_secs_f64(),
+                rate,
+                time_remaining
+            );
+        }
+    });
+
+    aprintln!("Uploading files to bucket {}", options.destination_bucket);
+
+    let upload_futures = document_lines.into_iter().map(|line| {
+        let client = client.clone();
+        let destination_bucket = options.destination_bucket.clone();
+        let destination_prefix = options.destination_prefix.clone().unwrap_or_default();
+        let uploaded_count = uploaded_count.clone();
+        let failed_count = failed_count.clone();
+        let semaphore = semaphore.clone();
+
+        async move {
+            let tuple: Vec<&str> = line.split(',').collect();
+
+            if tuple.is_empty() {
+                aprintln!("Invalid line format: `{}`. Expected at least 1 or 2 columns (local_path, [destination_prefix]).", line);
+                failed_count.fetch_add(1, Ordering::Relaxed);
+                return; // Skip invalid line
+            }
+
+            let local_path_str = tuple[0].trim();
+            let destination_prefix_str = if tuple.len() == 2 { tuple[1] } else { &destination_prefix };
+            let metadata_str = tuple.get(2).map(|s| s.trim()).unwrap_or("");
+
+            let local_path = PathBuf::from(local_path_str);
+            let file_name = match local_path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => {
+                    aprintln!("Invalid local path: `{}`. Cannot extract file name.", local_path_str);
+                    failed_count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            let s3_key = if destination_prefix_str.is_empty() {
+                file_name.to_string()
+            } else {
+                // Ensure no double slash if prefix doesn't end with one
+                if destination_prefix_str.ends_with('/') {
+                     f!("{}{}", destination_prefix_str, file_name)
+                } else {
+                     f!("{}/{}", destination_prefix_str, file_name)
+                }
+            };
+
+            let mut metadata: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            if !metadata_str.is_empty() {
+                 let pairs = metadata_str.split_whitespace();
+                 for pair in pairs {
+                     let split_pair: Vec<&str> = pair.splitn(2, '=').collect();
+                     if split_pair.len() == 2 {
+                         metadata.insert(split_pair[0].to_string(), split_pair[1].to_string());
+                     } else {
+                         aprintln!("Warning: Invalid metadata pair format in line `{}`: `{}`. Expected key=value.", line, pair);
+                     }
+                 }
+            }
+
+            // Acquire a permit for the semaphore
+            let _permit = match semaphore.acquire().await {
+                 Ok(p) => p,
+                 Err(e) => {
+                     aprintln!("Failed to acquire semaphore permit: {}. Skipping upload for {}", e, local_path_str);
+                     failed_count.fetch_add(1, Ordering::Relaxed);
+                     return;
+                 }
+            };
+
+            let upload_result = async {
+                 // Read file content
+                 let mut file = File::open(&local_path).await.map_err(|e| eyre!("Failed to open file {}: {}", local_path_str, e))?;
+                 let mut contents = Vec::new();
+                 file.read_to_end(&mut contents).await.map_err(|e| eyre!("Failed to read file {}: {}", local_path_str, e))?;
+                 let body = ByteStream::from_path(&local_path).await?;
+
+                 // Build PutObject request
+                 let mut request = client
+                     .put_object()
+                     .bucket(destination_bucket.as_str())
+                     .key(s3_key.as_str())
+                     .body(body);
+
+                 for (key, value) in metadata {
+                     request = request.metadata(key, value);
+                 }
+
+                 // Send request
+                 request.send().await.map_err(|e| eyre!("S3 PutObject failed for {}: {}", local_path_str, e))?;
+
+                 Ok(()) as Result<()>
+            }
+            .await;
+
+            match upload_result {
+                Ok(_) => {
+                    uploaded_count.fetch_add(1, Ordering::Relaxed);
+                    // Optionally log success
+                    // aprintln!("Uploaded {} to {}/{}", local_path_str, destination_bucket, s3_key);
+                }
+                Err(e) => {
+                    aprintln!("Failed to upload {}: {}", local_path_str, e);
+                    failed_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    join_all(upload_futures).await;
+
+    // Cancel the progress task when all upload operations are complete
+    progress_handle.abort();
+
+    let total_uploaded = uploaded_count.load(Ordering::Relaxed);
+    let total_failed = failed_count.load(Ordering::Relaxed);
+    let duration = start_time.elapsed();
+    let rate = (total_uploaded + total_failed) as f64 / duration.as_secs_f64();
+
+    aprintln!(
+        "\nUpload Summary: {}/{} files uploaded, {} failed in {:.2} seconds ({:.2} files/second)",
+        total_uploaded,
+        document_lines_length,
+        total_failed,
+        duration.as_secs_f64(),
+        rate
+    );
+
+    if total_failed > 0 {
+        Err(eyre!("{} file(s) failed to upload.", total_failed))
+    } else {
+        Ok(())
+    }
 }
