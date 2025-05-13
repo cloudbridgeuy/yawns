@@ -1,34 +1,27 @@
-FROM rust:slim-bullseye AS builder
-
+# cargo-chef and the Rust toolchain
+FROM lukemathwalker/cargo-chef:latest-rust-1.86.0 AS chef
 WORKDIR /app
 
-# Copy dependency manifests first for caching
-COPY Cargo.toml Cargo.lock ./
-
-# Build dependencies - allows caching if only src changes
-# Use dummy main.rs to force dependency build if no src copied yet
-RUN mkdir -p crates/yawns/src && echo "fn main() {}" > crates/yawns/src/main.rs
-# Add --target if cross-compiling, e.g., x86_64-unknown-linux-gnu
-RUN cargo build --release --frozen --locked --offline || true
-# Remove dummy src
-RUN rm -rf crates/
-
-# Copy source code
+FROM chef AS planner
+COPY Cargo.toml Cargo.toml
+COPY Cargo.lock Cargo.lock
 COPY crates/ crates/
 COPY xtask/ xtask/
-COPY .cargo/ .cargo/
+RUN cargo chef prepare --recipe-path recipe.json --bin yawns
 
-# Build application
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Build dependencies - this is the caching Docker layer!
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.toml
+COPY Cargo.lock Cargo.lock
+COPY crates/ crates/
+COPY xtask/ xtask/
+
 RUN cargo build --release --bin yawns
-
-# --- Final Stage ---
-FROM debian:bullseye-slim
-
+# We do not need the Rust toolchain to run the binary!
+FROM debian:bookworm-slim AS runtime
 WORKDIR /app
-
-# Copy the compiled binary from the builder stage
-COPY --from=builder /app/target/release/yawns ./yawns
-
-# Run the application
-ENTRYPOINT ["/app/yawns"]
-
+COPY --from=builder /app/target/release/yawns /usr/local/bin
+ENTRYPOINT ["/usr/local/bin/yawns"]
