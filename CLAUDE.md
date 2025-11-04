@@ -239,27 +239,66 @@ The pattern is based on separating code into two distinct layers:
 
 **Before (mixed logic and side effects):**
 
-```javascript
-function sendUserExpiryEmail(): void {
-  for (const user of db.getUsers()) {
-    if (user.subscriptionEndDate > Date.now()) continue;
-    if (user.isFreeTrial) continue;
-    email.send(user.email, "Your account has expired " + user.name + ".");
-  }
+```rust
+async fn send_user_expiry_emails(db: &Database, email_service: &EmailService) -> Result<()> {
+    let users = db.get_users().await?;
+
+    for user in users {
+        if user.subscription_end_date > Utc::now() {
+            continue;
+        }
+        if user.is_free_trial {
+            continue;
+        }
+
+        email_service
+            .send(
+                &user.email,
+                &format!("Your account has expired {}.", user.name),
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 ```
 
 **After (separated):**
 
 **Functional Core:**
-```javascript
-getExpiredUsers(users, cutoff) // pure filtering logic
-generateExpiryEmails(users)    // pure email generation
+```rust
+// Pure filtering logic - no side effects
+fn get_expired_users(users: &[User], cutoff: DateTime<Utc>) -> Vec<&User> {
+    users
+        .iter()
+        .filter(|user| user.subscription_end_date <= cutoff)
+        .filter(|user| !user.is_free_trial)
+        .collect()
+}
+
+// Pure email generation - no side effects
+fn generate_expiry_emails(users: &[&User]) -> Vec<Email> {
+    users
+        .iter()
+        .map(|user| Email {
+            to: user.email.clone(),
+            subject: "Account Expired".to_string(),
+            body: format!("Your account has expired {}.", user.name),
+        })
+        .collect()
+}
 ```
 
 **Imperative Shell:**
-```javascript
-email.bulkSend(generateExpiryEmails(getExpiredUsers(db.getUsers(), Date.now())))
+```rust
+// Orchestrates I/O operations using pure functions
+async fn send_user_expiry_emails(db: &Database, email_service: &EmailService) -> Result<()> {
+    let users = db.get_users().await?;
+    let expired = get_expired_users(&users, Utc::now());
+    let emails = generate_expiry_emails(&expired);
+    email_service.bulk_send(&emails).await?;
+    Ok(())
+}
 ```
 
 ### Benefits
