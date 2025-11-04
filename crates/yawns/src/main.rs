@@ -8,6 +8,7 @@ mod error;
 mod kms;
 mod prelude;
 mod s3;
+mod upgrade;
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -45,6 +46,9 @@ pub enum SubCommands {
 
     /// AWS S3
     S3(crate::s3::App),
+
+    /// Upgrade yawns to the latest version
+    Upgrade(crate::upgrade::App),
 }
 
 #[tokio::main]
@@ -57,6 +61,7 @@ async fn main() -> Result<()> {
     match app.command {
         SubCommands::KMS(sub_app) => crate::kms::run(sub_app, app.global).await,
         SubCommands::S3(sub_app) => crate::s3::run(sub_app, app.global).await,
+        SubCommands::Upgrade(sub_app) => crate::upgrade::run(sub_app, app.global).await,
     }
     .map_err(|err: color_eyre::eyre::Report| eyre!(err))
 }
